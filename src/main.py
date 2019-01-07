@@ -3,7 +3,10 @@ import boto3
 import paramiko
 import threading
 
-INSTANCE_FILTER = {'Name': 'instance-state-name', 'Values': ['running']}
+USERNAME_ON_INSTANCE = "ec2-user"
+
+PEM_FILE_LOCATION = "../res/Test.pem"
+RUNNING_INSTANCES_FILTER = {'Name': 'instance-state-name', 'Values': ['running']}
 
 
 def main():
@@ -24,18 +27,18 @@ class Flags:
         self._flags = {'above_threshold_signal': False, 'rerun_vms_signal': False}
 
     @staticmethod
-    def getFlags():
+    def get_flags():
         if not Flags._instance:
             Flags._instance = Flags()
 
         return dict(Flags._instance._flags)
 
     @staticmethod
-    def setFlag(flag):
+    def set_flag(flag):
         Flags._instance._flags[flag] = True
         print "[Flags] - %s was set" % flag
 
-    def unsetFlag(self, flag):
+    def unset_flag(self, flag):
         Flags._instance._flags[flag] = False
         print "[Flags] - %s was unset" % flag
 
@@ -45,9 +48,9 @@ class SpotPriceMonitor(threading.Thread):
     _THRESHOLD_DEADLINE = 5  # If threshold is passed more than this number of second it's time to start/stop the vms
 
     def __init__(self):
-        super( SpotPriceMonitor, self).__init__()
+        super(SpotPriceMonitor, self).__init__()
         self._above_threshold_time = None
-        self._client = getEc2Client()
+        self._client = get_ec2_client()
 
     def run(self):
         while True:
@@ -57,12 +60,13 @@ class SpotPriceMonitor(threading.Thread):
                     self._above_threshold_time = time.time()
                 else:
                     if time.time() - self._above_threshold_time > SpotPriceMonitor._THRESHOLD_DEADLINE:
-                        Flags.setFlag('above_threshold_signal')
+                        Flags.set_flag('above_threshold_signal')
+                        Flags.unset_flag('rerun_vms_signal')
 
             else:
                 self._above_threshold_time = None
-                Flags.unsetFlag('above_threshold_signal')
-                Flags.setFlag('rerun_vms_signal')
+                Flags.unset_flag('above_threshold_signal')
+                Flags.set_flag('rerun_vms_signal')
 
             time.sleep(1)
 
@@ -80,45 +84,49 @@ class VmCommunication(threading.Thread):
         self._test_queue = boto3.resource('sqs').get_queue_by_name(QueueName=VmCommunication._VM_1_QUEUE_NAME)
         self._sent_shutdown_signal = False
         self._sent_rerun_signal = False
-        self._ec2 = getEc2Client()
+        self._ec2 = get_ec2_client()
 
     def run(self):
-        if Flags.getFlags()['above_threshold_signal']:
-            if not self._sent_shutdown_signal:
-                self.test_queue_message("[VMCommunication] Start shutting down vms")
-                self._sent_shutdown_signal = True
-                self._sent_rerun_signal = False
+        while True:
+            if Flags.get_flags()['above_threshold_signal']:
+                if not self._sent_shutdown_signal:
+                    self._test_queue_message("[VMCommunication] Start shutting down vms")
+                    self._sent_shutdown_signal = True
+                    self._sent_rerun_signal = False
 
-        if Flags.getFlags()['rerun_vms_signal']:
-            if not self._sent_rerun_signal:
-                self.test_queue_message("[VMCommunication] Rerun VMs")
-                self._sent_rerun_signal = True
-                self._sent_shutdown_signal = False
+            if Flags.get_flags()['rerun_vms_signal']:
+                if not self._sent_rerun_signal:
+                    self._test_queue_message("[VMCommunication] Rerun VMs")
+                    self._sent_rerun_signal = True
+                    self._sent_shutdown_signal = False
 
-        time.sleep(1)
+            time.sleep(1)
 
-    def test_queue_message(self, msg):
+    def _test_queue_message(self, msg):
         self._test_queue.send_message(MessageBody=msg)
         print "queue %s received the following message: %s" % (self._test_queue.attributes['QueueArn'], msg)
 
     def _get_number_of_running_vms(self):
-        return len(self._ec2.instances().filter(INSTANCE_FILTER))
+        return len(self._ec2.instances().filter(RUNNING_INSTANCES_FILTER))
 
-#From here it's just for pocs I havn't got to the point of integrating this to the code.
-def getListOfProcesses():
-    def get_list_of_process_from_machine(instance):
-        cmd = "ps -ef"  # Assuming: Working on a linux machine
-        return sshToMachine(instance, cmd, instance_filter=INSTANCE_FILTER)
-    executeOnListOfMachinesPeriodically(get_list_of_process_from_machine)
 
-def sshToMachine(instance, cmd):
-    key = paramiko.RSAKey.from_private_key_file("../res/Test.pem")
+# From here it's just for POCs I haven't got to the point of integrating this to the code.
+def get_list_of_process_from_machine(instance):
+    cmd = "ps -ef"  # Assuming: Working on a linux machine
+    return execute_command_on_instance(instance, cmd, instance_filter=RUNNING_INSTANCES_FILTER)
+
+
+def get_list_of_processes():
+    execute_command_on_list_of_machines_periodically(get_list_of_process_from_machine)
+
+
+def execute_command_on_instance(instance, cmd):
+    key = paramiko.RSAKey.from_private_key_file(PEM_FILE_LOCATION)
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     # Connect/ssh to an instance
-    # Here 'ubuntu' is user name and 'instance_ip' is public IP of EC2
-    client.connect(hostname=instance.public_dns_name, username="ec2-user", pkey=key)
+    client.connect(hostname=instance.public_dns_name, username=USERNAME_ON_INSTANCE, pkey=key)
 
     # Execute a command(cmd) after connecting/ssh to an instance
     stdin, stdout, stderr = client.exec_command(cmd)
@@ -128,7 +136,10 @@ def sshToMachine(instance, cmd):
     client.close()
     return response
 
-def executeOnListOfMachinesPeriodically(cmd = lambda instance: "State: %s,\tId: %s" % (instance.state['Name'], instance.id), instance_filter= []):
+
+def execute_command_on_list_of_machines_periodically(cmd=lambda instance: "State: %s,\tId: %s" %
+                                                                          (instance.state['Name'], instance.id),
+                                                     instance_filter=[]):
     ec2 = boto3.resource('ec2')
     while True:
         instances = ec2.instances.filter(instance_filter)
@@ -137,7 +148,8 @@ def executeOnListOfMachinesPeriodically(cmd = lambda instance: "State: %s,\tId: 
         print ""
         time.sleep(3)
 
-def getEc2Client():
+
+def get_ec2_client():
     client = boto3.client('ec2', region_name='us-east-1')
     return client
 
